@@ -1,0 +1,39 @@
+flowchart LR
+
+    A[User Query]
+    --> B[Embedding Model]
+
+    B --> C{Cache hit?}
+
+    C -->|Yes| D[Return Cached Response]
+
+    C -->|No| E[Embedding Classifier]
+
+    E --> F[qwen-coder]
+    E --> G[deepseek-r1]
+    E --> H[gemma3]
+    E --> I[llama3.2]
+
+    F --> J[ChromaDB Memory]
+    G --> J
+    H --> J
+    I --> J
+
+    J --> K[Generate Response]
+
+    K --> L{Coding?}
+
+    L -->|Yes| M[Code Validator]
+    L -->|No| N[Cheap Validator]
+
+    M --> O{Pass?}
+    N --> P{High Confidence?}
+
+    O -->|No| Q[Deep Validator]
+    P -->|No| Q
+
+    O -->|Yes| R[Store in ChromaDB]
+    P -->|Yes| R
+    Q --> R
+
+    R --> S[Final Response]

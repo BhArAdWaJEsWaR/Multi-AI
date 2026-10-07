@@ -33,6 +33,29 @@
 4. A validator agent (llama3.2) checks the response for errors/inconsistencies.
 5. The exchange is stored back into vector memory for future queries.
 
+For image requests, the vision model is an extraction stage only: it performs OCR
+and describes relevant visual content, then the extracted content is routed
+through the normal coding / math / writing / general classifier and difficulty
+tiers. The selected specialist answers the request; the vision model does not
+answer or determine the final category.
+
+## Conversation behavior
+
+The active chat keeps the last 24 user/assistant turns in temporary process
+memory and sends them to every specialist, including when routing switches
+domains. This gives follow-up messages their normal chat meaning without
+persisting ordinary questions and answers. The temporary chat disappears when
+the process exits.
+
+Only explicit preference updates are written to ChromaDB for persistence across
+restarts. Existing older Q&A records may remain in the ChromaDB directory, but
+new ordinary exchanges are no longer added there.
+
+Models are not forcibly unloaded when the topic changes, and ordinary
+conversation uses a fast path (no difficulty-estimator or validator call).
+Pass `use_validator=True` to `Orchestrator` when response validation is
+preferred over latency.
+
 ## Notes
 
 - First run downloads the `all-MiniLM-L6-v2` embedding model (~80MB) for ChromaDB.
