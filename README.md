@@ -63,3 +63,15 @@ preferred over latency.
 - To add a new agent: add an entry to `AGENTS` in `core/agents.py`, add its label
   to `VALID_LABELS` in `core/orchestrator.py`, and update the coordinator's
   system prompt to mention the new category.
+
+## Browser frontend
+
+Start the lightweight browser chat UI from the project root:
+
+```bash
+python3 frontend_server.py
+```
+
+Open `http://127.0.0.1:8000`. The frontend uses the same in-process
+`Orchestrator` as the terminal interface, so temporary chat context and
+persistent preferences behave the same way. Stop it with `Ctrl+C`.

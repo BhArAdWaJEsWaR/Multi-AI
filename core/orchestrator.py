@@ -585,18 +585,19 @@ class Orchestrator:
                 "confirmation": f"Got it — I will remember your name is {name}.",
             }
 
-        preference_markers = (
-            "prefer", "preference", "like", "always", "never",
-            "from now on", "for now on", "use", "instead of", "rather than",
-            "my choice is", "i choose", "i would like"
+        explicit_preference_patterns = (
+            r"\b(?:i|we)\s+(?:prefer|like|want|need|choose)\b",
+            r"\bmy\s+(?:preference|choice)\b",
+            r"\b(?:from now on|for now on|henceforth)\b",
+            r"\b(?:always|never)\s+(?:use|write|answer|respond|explain|show|choose)\b",
+            r"\b(?:instead of|rather than)\b",
+            r"\b(?:my choice is|my preference is)\b",
+            r"\b(?:my name is|call me)\b",
         )
-        if not any(marker in q_lower for marker in preference_markers):
+        if not any(re.search(pattern, q_lower) for pattern in explicit_preference_patterns):
             # Avoid treating generic 'I want to learn X' or 'I need to know X' as persistent preferences
             if re.search(r"\b(i|we|you)\s+(want|need)\s+to\s+(learn|know|understand|get|see|read|ask|explain)\b", q_lower):
                 return None
-            if "want" not in q_lower and "need" not in q_lower:
-                return None
-            # If 'want'/'need' is present but not used as a preference-signal, skip it.
             return None
 
         # Domain inference from the content of the preference phrase.
@@ -612,11 +613,16 @@ class Orchestrator:
 
         # Extract the preference phrase after markers.
         phrase = None
-        for marker in ("prefer ", "preference is ", "i like ", "i want ", "i need ", "i would like ", "always use ", "use ", "from now on use ", "my choice is "):
-            idx = q_lower.find(marker)
-            if idx != -1:
-                start = idx + len(marker)
-                phrase = q[start:].strip()
+        marker_patterns = (
+            r"\bprefer\s+", r"\bpreference is\s+", r"\bi like\s+",
+            r"\bi want\s+", r"\bi need\s+", r"\bi would like\s+",
+            r"\balways use\s+", r"\bnever use\s+", r"\buse\s+",
+            r"\bfrom now on use\s+", r"\bmy choice is\s+",
+        )
+        for marker_pattern in marker_patterns:
+            marker_match = re.search(marker_pattern, q_lower)
+            if marker_match:
+                phrase = q[marker_match.end():].strip()
                 break
         if phrase is None:
             # Generic fallback: extract after 'prefer'/'like' or after 'i prefer'.
@@ -668,6 +674,20 @@ class Orchestrator:
         Returns a structured dict or None.
         """
         q_lower = query.lower()
+        reset_match = re.search(
+            r"\b(?:reset|clear|delete|remove)\s+(?:all\s+)?my\s+"
+            r"(?:(?:coding|writing|math|general|all)\s+)?"
+            r"(?:preferences?|choices?|settings?)\b",
+            q_lower,
+        )
+        if reset_match:
+            domain = "all"
+            for candidate in ("coding", "writing", "math", "general"):
+                if candidate in q_lower:
+                    domain = candidate
+                    break
+            return {"type": "RESET", "domain": domain}
+
         # Questions about an existing preference must never be sent to the
         # setter classifier. They are read-only inspection requests.
         asks_about_preference = (
@@ -688,13 +708,22 @@ class Orchestrator:
         if direct:
             return direct
 
-        pref_triggers = (
-            "prefer", "preference", "choice", "always", "never", "from now on",
-            "henceforth", "use", "using", "switch", "change", "update", "set",
-            "reset", "stop", "remove", "delete", "clear", "like", "want", "need",
-            "my name", "call me", "show", "what are my", "tone", "style", "format"
+        # Match explicit preference language, not isolated words. For example,
+        # "binary search always runs in O(log n)" is a factual question, not a
+        # preference, while "always use recursion" is a preference.
+        preference_patterns = (
+            r"\b(?:i|we)\s+(?:prefer|like|want|need|choose)\b",
+            r"\bmy\s+(?:preference|choice)\b",
+            r"\b(?:from now on|henceforth)\b",
+            r"\b(?:always|never)\s+(?:use|write|answer|respond|explain|show|choose)\b",
+            r"\b(?:change|switch|update|set|reset|remove|delete|clear)\s+(?:my\s+)?(?:preference|choice|setting|style|format)\b",
+            r"\b(?:my name is|call me)\b",
+            r"\b(?:what are|show|tell me)\s+my\s+(?:preferences?|choices?|settings?)\b",
+            r"\bwhich\s+(?:coding|writing|math|general)?\s*preferences?\b",
         )
-        has_preference_trigger = any(word in q_lower for word in pref_triggers)
+        has_preference_trigger = any(
+            re.search(pattern, q_lower) for pattern in preference_patterns
+        )
         has_memory_question = any(signal in q_lower for signal in (
             "remember", "do you know", "what did i say", "what did we discuss",
             "my preference", "my preferences", "what do you know about me",
@@ -1019,48 +1048,55 @@ class Orchestrator:
 
         cheap_result = AGENTS["cheap_validator"].run(cheap_input, stream=False)
 
-        # Minimal, targeted validation: keep the original unless the validator 
-        # explicitly flags a real issue and gives a repair.
-        status = "PASS"
+        # The validator critiques every answer, but only changes the answer
+        # when it reports a real problem.
+        status = "VALID"
+        critique = "none"
         issues = "none"
-        repair = ""
+        final = ""
 
         lines = cheap_result.splitlines()
+        current_field = None
+        field_values: dict[str, list[str]] = {}
         for line in lines:
             stripped = line.strip()
-            if stripped.upper().startswith("STATUS:"):
-                val = stripped.split(":", 1)[1].strip().upper()
-                if val in ("PASS", "FAIL"):
-                    status = val
-            elif stripped.upper().startswith("ISSUES:"):
-                issues = stripped.split(":", 1)[1].strip()
-            elif stripped.upper().startswith("REPAIR:"):
-                repair = stripped.split(":", 1)[1].strip()
+            field_match = re.match(r"^(STATUS|CRITIQUE|ISSUES|FINAL):\s*(.*)$", stripped, re.IGNORECASE)
+            if field_match:
+                current_field = field_match.group(1).upper()
+                field_values[current_field] = [field_match.group(2).strip()]
+            elif current_field:
+                field_values[current_field].append(line)
+
+        status = field_values.get("STATUS", ["VALID"])[0].upper()
+        if status == "PASS":
+            status = "VALID"
+        elif status == "FAIL":
+            status = "INVALID"
+        critique = "\n".join(field_values.get("CRITIQUE", ["none"])).strip() or "none"
+        issues = "\n".join(field_values.get("ISSUES", ["none"])).strip() or "none"
+        final = "\n".join(field_values.get("FINAL", [])).strip()
 
         if verbose:
-            print(f"  → status: {status} | issues: {issues}\n")
+            print(f"[validator] {critique}")
+            print(f"[validator] issues: {issues}")
+            print(f"[validator] status: {status}\n")
 
-        # If the validator says PASS, do not keep a non-empty "none" issue list
-        # as an error signal. This keeps the logger clean and matches the model's intent.
-        if status == "PASS" and issues.lower() == "none":
-            issues = "none"
-
-        if status == "PASS":
+        if status == "VALID":
             return response, False
 
-        # If the validator failed, use only the minimal repair it provided.
-        # Reject identical echoes: the validator must produce a materially different fix.
-        if repair and repair.strip() != response.strip():
+        # Apply only a materially different final answer for invalid output.
+        if final and final.strip() != response.strip():
             if verbose:
-                print(f"[cheap_validator] ✏ Applying minimal repair ({len(repair)} chars)\n")
-            return repair, False
+                print(f"[validator] Applying targeted correction ({len(final)} chars)\n")
+            return final, False
 
-        # repair was empty or identical to the original answer: keep original
+        # Invalid without a usable correction: keep the original rather than
+        # exposing the validator's review as the answer.
         if not ESCALATE_ON_FAIL:
             if not USE_DEEP_VAL:
                 return response, False
             if verbose:
-                print("[deep_validator] No materially different repair produced; keeping original answer.\n")
+                print("[validator] No targeted correction produced; keeping original answer.\n")
             return response, False
 
         # ── FAIL without repair: escalate or deep-validate ─────────────────────
@@ -1201,6 +1237,40 @@ class Orchestrator:
                     "escalated":  False,
                     "image_path": None,
                     "response":   msg,
+                }
+
+            if pref_update["type"] == "RESET":
+                requested_domain = pref_update.get("domain", "all")
+                if requested_domain == "all":
+                    removed_count = len(self._active_preferences)
+                    self._active_preferences.clear()
+                    if self.use_memory:
+                        self.memory.remove_by_metadata({"type": "preference_update"})
+                    msg = f"Cleared {removed_count} saved preference(s)."
+                else:
+                    matched_keys = [
+                        key for key, value in self._active_preferences.items()
+                        if value.get("domain") in (requested_domain, "all")
+                    ]
+                    for key in matched_keys:
+                        self._active_preferences.pop(key, None)
+                        if self.use_memory:
+                            self.memory.remove_by_metadata({
+                                "type": "preference_update",
+                                "pref_key": key,
+                            })
+                    msg = f"Cleared {len(matched_keys)} {requested_domain} preference(s)."
+                self._last_embedding = None
+                self._last_task_type = None
+                if verbose:
+                    print(f"\n{msg}\n")
+                return {
+                    "task_type": "general",
+                    "difficulty": "easy",
+                    "tier": "preference",
+                    "escalated": False,
+                    "image_path": None,
+                    "response": msg,
                 }
 
             key = pref_update["key"]
