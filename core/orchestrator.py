@@ -168,10 +168,31 @@ _CODING_WORD_BOUNDARY_TERMS = (
 # Terms that are already unambiguous — substring match is safe
 _CODING_EXACT_TERMS = (
     "write code", "write a function", "write a class", "write a program",
-    "c++", "def ", "for ", "while ", "if ",
+    "c++", "def ",
     "binary search", "quick sort", "merge sort",
     "api", "html", "css", "file io",
     "programming", "scripting", "coding",
+)
+_CODING_CONSTRUCT_PATTERNS = (
+    r"\b(?:write|create|build|implement|show|give me)\b.{0,40}\b"
+    r"(?:a|an|the)\s+(?:function|class|program|script|algorithm|code)\b",
+    r"\b(?:write|create|implement|show|give me)\b.{0,30}\b"
+    r"(?:if|for|while)\s+(?:statement|loop|condition)\b",
+)
+_STRONG_CODING_TERMS = (
+    "write code", "write a function", "write a class", "write a program",
+    "c++", "def ", "binary search", "quick sort", "merge sort",
+    "programming", "scripting", "coding",
+)
+_WRITING_WORD_BOUNDARY_TERMS = (
+    "email", "essay", "poem", "invitation", "letter", "message",
+    "note", "report", "article", "blog", "resume", "complaint",
+)
+_WRITING_EXACT_TERMS = (
+    "write an email", "write a message", "write a letter",
+    "draft an email", "draft a message", "draft a letter",
+    "compose an email", "compose a message", "compose a letter",
+    "write an invitation", "draft an invitation",
 )
 _MATH_WORD_BOUNDARY_TERMS = (
     "solve", "calculate", "prove", "simplify",
@@ -183,6 +204,10 @@ _MATH_EXACT_TERMS = (
     "equation", "factorial", "triangle", "sum of",
     "what is the probability", "find the probability",
     "sqrt", "standard deviation", "permutation", "combination",
+)
+_MATH_EXPRESSION_RE = re.compile(
+    r"(?:\b\d+\s*[a-z]\b|\b[a-z]\s*(?:\^|²|[+\-*/])\s*\d+)",
+    re.IGNORECASE,
 )
 
 
@@ -196,6 +221,7 @@ def _looks_like_math_query(query: str) -> bool:
     has_math = (
         any(term in q for term in _MATH_EXACT_TERMS)
         or _word_match(q, _MATH_WORD_BOUNDARY_TERMS)
+        or bool(_MATH_EXPRESSION_RE.search(q))
     )
     has_code = (
         any(term in q for term in _CODING_EXACT_TERMS)
@@ -209,6 +235,26 @@ def _looks_like_coding_query(query: str) -> bool:
     return (
         any(term in q for term in _CODING_EXACT_TERMS)
         or _word_match(q, _CODING_WORD_BOUNDARY_TERMS)
+        or any(re.search(pattern, q) for pattern in _CODING_CONSTRUCT_PATTERNS)
+    )
+
+
+def _has_explicit_coding_intent(query: str) -> bool:
+    q = query.lower()
+    return (
+        any(term in q for term in _STRONG_CODING_TERMS)
+        or any(re.search(pattern, q) for pattern in _CODING_CONSTRUCT_PATTERNS)
+    )
+
+
+def _looks_like_writing_query(query: str) -> bool:
+    """Detect explicit prose-generation intent before semantic routing."""
+    q = query.lower()
+    if _has_explicit_coding_intent(query):
+        return False
+    return (
+        any(term in q for term in _WRITING_EXACT_TERMS)
+        or _word_match(q, _WRITING_WORD_BOUNDARY_TERMS)
     )
 
 
@@ -219,7 +265,11 @@ def _looks_like_general_explanation_query(query: str) -> bool:
         "how does ", "how do ", "why does ", "why do ", "tell me about ",
         "difference between ", "compare ", "what is the difference between ",
     )
-    return any(p in q for p in patterns) and not _looks_like_coding_query(query)
+    return (
+        any(p in q for p in patterns)
+        and not _looks_like_coding_query(query)
+        and not _looks_like_math_query(query)
+    )
 
 
 def _needs_long_term_memory(query: str) -> bool:
@@ -561,6 +611,61 @@ class Orchestrator:
         }
         return removed_keys
 
+    def _clear_preference_context(self, domain: str) -> None:
+        """Remove preference-bearing turns from the current chat context."""
+        if not self._conversation_history:
+            return
+
+        marker = "user preferences for "
+        retained: list[dict[str, str]] = []
+        index = 0
+        while index < len(self._conversation_history):
+            item = self._conversation_history[index]
+            content = item.get("content", "").lower()
+            preference_match = re.search(
+                rf"{re.escape(marker)}(coding|writing|math|general|all)\b",
+                content,
+            )
+            preference_domain = preference_match.group(1) if preference_match else None
+            if preference_domain and (
+                domain == "all" or preference_domain in (domain, "all")
+            ):
+                # Preference-bearing user turns are stored immediately before
+                # their assistant response, so remove the pair together.
+                index += 2 if (
+                    index + 1 < len(self._conversation_history)
+                    and self._conversation_history[index + 1].get("role") == "assistant"
+                ) else 1
+                continue
+            retained.append(item)
+            index += 1
+        self._conversation_history = retained
+
+    def _remove_persisted_preferences(self, domain: str) -> int:
+        """Remove all matching preference records, including stale duplicates."""
+        if not self.use_memory:
+            return 0
+
+        entries = self.memory.get_by_metadata({"type": "preference_update"})
+        removed = 0
+        seen: set[tuple[str, str]] = set()
+        for _, metadata in entries:
+            entry_domain = metadata.get("domain", "all")
+            if domain != "all" and entry_domain not in (domain, "all"):
+                continue
+            key = metadata.get("pref_key", "")
+            identity = (key, entry_domain)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            where = {"type": "preference_update"}
+            if key:
+                where["pref_key"] = key
+            if entry_domain:
+                where["domain"] = entry_domain
+            removed += self.memory.remove_by_metadata(where)
+        return removed
+
     def _extract_explicit_preference(self, query: str) -> dict | None:
         """Fast deterministic parser for clear preference statements.
 
@@ -675,9 +780,10 @@ class Orchestrator:
         """
         q_lower = query.lower()
         reset_match = re.search(
-            r"\b(?:reset|clear|delete|remove)\s+(?:all\s+)?my\s+"
+            r"\b(?:reset|clear|delete|remove|forget)\s+(?:all\s+)?my\s+"
             r"(?:(?:coding|writing|math|general|all)\s+)?"
-            r"(?:preferences?|choices?|settings?)\b",
+            r"(?:preferences?|choices?|settings?)"
+            r"(?:\s+(?:in|for)\s+(?:coding|writing|math|general|all))?\b",
             q_lower,
         )
         if reset_match:
@@ -834,6 +940,9 @@ class Orchestrator:
         # For image-derived input, extracted words such as "function", "code", or
         # "algorithm" may describe a diagram rather than the user's intended task.
         # Let the coordinator/classifier evaluate the complete extracted content.
+        if not from_image_extraction and _looks_like_writing_query(query):
+            print("[keyword] Detected writing request, routing to writing before topic cache")
+            return "writing", "keyword_writing", None
         if not from_image_extraction and _looks_like_general_explanation_query(query):
             print("[keyword] Detected general explanation, routing to general before topic cache")
             return "general", "keyword_general", None
@@ -1244,8 +1353,6 @@ class Orchestrator:
                 if requested_domain == "all":
                     removed_count = len(self._active_preferences)
                     self._active_preferences.clear()
-                    if self.use_memory:
-                        self.memory.remove_by_metadata({"type": "preference_update"})
                     msg = f"Cleared {removed_count} saved preference(s)."
                 else:
                     matched_keys = [
@@ -1254,12 +1361,9 @@ class Orchestrator:
                     ]
                     for key in matched_keys:
                         self._active_preferences.pop(key, None)
-                        if self.use_memory:
-                            self.memory.remove_by_metadata({
-                                "type": "preference_update",
-                                "pref_key": key,
-                            })
                     msg = f"Cleared {len(matched_keys)} {requested_domain} preference(s)."
+                self._remove_persisted_preferences(requested_domain)
+                self._clear_preference_context(requested_domain)
                 self._last_embedding = None
                 self._last_task_type = None
                 if verbose:
